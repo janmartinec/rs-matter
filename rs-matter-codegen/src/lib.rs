@@ -44,6 +44,25 @@ fn format_tokens(tokens: proc_macro2::TokenStream) -> String {
 /// the rs-matter crate (e.g. `"crate"` when called from rs-matter's own build.rs,
 /// or `"rs_matter"` when used by external crates).
 pub fn generate(rs_matter_crate: &str, dest_dir: &Path) {
+    generate_filtered(rs_matter_crate, dest_dir, None);
+}
+
+/// Like [`generate`], but optionally restricts code generation to a subset of
+/// clusters, matched by their generated snake_case module name (e.g. `on_off`,
+/// `level_control`). `only = None` generates every cluster, exactly like
+/// [`generate`]; `only = Some(&[...])` emits only the listed clusters.
+///
+/// The `globals` module is always generated regardless of the filter.
+///
+/// Why filter: the full Matter IDL expands to ~670k lines of Rust across 142
+/// clusters, and rustc compiling all of it is what drives peak build RAM into
+/// the multi-GB range. A typical device needs only a few dozen clusters.
+/// Generated cluster modules reference only `crate::` items and `decl::globals`
+/// — never each other — so any subset compiles standalone. The caller must
+/// include every cluster that the rs-matter core itself references internally
+/// (e.g. `operational_credentials`, `network_commissioning`, `time_synchronization`),
+/// otherwise rs-matter will fail to compile with "module not found".
+pub fn generate_filtered(rs_matter_crate: &str, dest_dir: &Path, only: Option<&[&str]>) {
     let idl_file = CSA_STANDARD_CLUSTERS_IDL_V1_5_1_0;
 
     let idl = match Idl::parse(idl_file.into()) {
@@ -72,6 +91,15 @@ pub fn generate(rs_matter_crate: &str, dest_dir: &Path) {
 
     for c in &idl.clusters {
         let (module_name, content) = cluster_content(c, &idl.globals, &context);
+
+        // Skip clusters not in the whitelist. We compute `module_name` (cheap)
+        // before the expensive prettyplease formatting + file write below, so a
+        // filtered build only pays the formatting cost for the kept clusters.
+        if let Some(only) = only {
+            if !only.contains(&module_name.as_str()) {
+                continue;
+            }
+        }
 
         let formatted = format_tokens(content);
         let file_path = clusters_dir.join(format!("{module_name}.rs"));

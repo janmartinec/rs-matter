@@ -25,9 +25,41 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    rs_matter_codegen::generate("crate", &out_dir);
+    generate_clusters(&out_dir);
 
     capture_build_time(&out_dir);
+}
+
+/// Generate the IDL cluster code, optionally restricted to a whitelist.
+///
+/// By default every Matter cluster is generated (~670k lines of Rust), which is
+/// the dominant cost of building rs-matter both in time and in peak memory. To
+/// build only the clusters an application actually uses, set the
+/// `RS_MATTER_CLUSTERS` environment variable to a comma-separated list of
+/// snake_case cluster module names, e.g.:
+///
+/// ```text
+/// RS_MATTER_CLUSTERS=on_off,level_control,descriptor,basic_information
+/// ```
+///
+/// The list MUST include every cluster that rs-matter references internally
+/// (operational_credentials, network_commissioning, time_synchronization, the
+/// diagnostics clusters, etc.) or compilation will fail with "module not found".
+/// Unset (or empty) means "generate everything" — the original behaviour.
+fn generate_clusters(out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=RS_MATTER_CLUSTERS");
+
+    match std::env::var("RS_MATTER_CLUSTERS") {
+        Ok(list) if !list.trim().is_empty() => {
+            let clusters: Vec<&str> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            rs_matter_codegen::generate_filtered("crate", out_dir, Some(&clusters));
+        }
+        _ => rs_matter_codegen::generate("crate", out_dir),
+    }
 }
 
 fn capture_build_time(out_dir: &Path) {
