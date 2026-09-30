@@ -32,11 +32,12 @@ use futures_lite::StreamExt;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 use zbus::Connection;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::transport::network::mdns::{DottedName, MdnsRemoteService};
 use crate::transport::network::MatterLocalService;
 use crate::utils::select::Coalesce;
 use crate::utils::zbus_proxies::avahi::entry_group::EntryGroupProxy;
+use crate::utils::zbus_proxies::avahi::server::ServerProxy;
 use crate::utils::zbus_proxies::avahi::server2::Server2Proxy;
 use crate::utils::zbus_proxies::avahi::service_browser::ServiceBrowserProxy;
 use crate::Matter;
@@ -88,6 +89,13 @@ const AVAHI_IF_UNSPEC: i32 = -1;
 /// Avahi constant for "any protocol" (IPv4 or IPv6)
 const AVAHI_PROTO_UNSPEC: i32 = -1;
 
+/// `AvahiServerState`: the server is (re)establishing its host name records.
+const AVAHI_SERVER_REGISTERING: i32 = 1;
+/// `AvahiServerState`: the host name records are established.
+const AVAHI_SERVER_RUNNING: i32 = 2;
+/// `AvahiServerState`: the host name collided with another host on the network.
+const AVAHI_SERVER_COLLISION: i32 = 3;
+
 /// Interval (ms) at which a running browse re-checks whether it is still in
 /// flight (first match consumed, or caller timed out / dropped).
 const BROWSE_POLL_INTERVAL_MS: u64 = 250;
@@ -123,28 +131,111 @@ impl AvahiMdns {
             .await
     }
 
-    /// Publish the local Matter services and keep them in sync with the stack.
+    /// Publish the local Matter services and keep them in sync with the stack
+    /// and with the Avahi host name.
+    ///
+    /// The services are registered with an empty host, so Avahi binds their SRV
+    /// records to the host name it has *at registration time*. When that name
+    /// collides with another host on the network (e.g. two devices shipping the
+    /// same default name), Avahi picks a new one (`foo` → `foo-2`) and moves
+    /// through COLLISION → REGISTERING → RUNNING. Services registered before
+    /// would keep pointing at the old name — i.e. at the *other* host — and
+    /// controllers could no longer reach this node. As the Avahi client
+    /// documentation prescribes, the entry groups are therefore withdrawn while
+    /// the host name is being re-established and registered anew once the
+    /// server is running again. The same path covers an Avahi daemon restart.
+    ///
+    /// The daemon emits `StateChanged` only on the original
+    /// `org.freedesktop.Avahi.Server` interface
+    /// (`dbus_protocol_server_state_changed` in `avahi-daemon/dbus-protocol.c`),
+    /// which is also where `libavahi-client` listens for it — never on `Server2`,
+    /// even though `Server2Proxy` declares the signal as well. The state is
+    /// therefore watched there; the methods go through `Server2` like
+    /// everywhere else in this backend.
     async fn run_respond(&mut self, matter: &Matter<'_>) -> Result<(), Error> {
-        {
-            let avahi = Server2Proxy::new(&self.connection).await?;
-            info!("Avahi API version: {}", avahi.get_apiversion().await?);
-        }
+        let connection = self.connection.clone();
+        let avahi = Server2Proxy::new(&connection).await?;
+        let server = ServerProxy::new(&connection).await?;
+        info!("Avahi API version: {}", avahi.get_apiversion().await?);
+
+        // Subscribe before reading the state, so that no transition is missed.
+        let mut state_changes = server.receive_state_changed().await?;
+        let mut running = avahi.get_state().await? == AVAHI_SERVER_RUNNING;
 
         loop {
-            matter.transport().wait_mdns().await;
+            let services_changed = pin!(matter.transport().wait_mdns());
+            let state_changed = pin!(state_changes.next());
 
-            let mut services = HashSet::new();
-            matter.mdns_services(|service| {
-                services.insert(service);
+            match select(services_changed, state_changed).await {
+                Either::First(()) => {
+                    if running {
+                        info!("mDNS services changed, updating...");
+                        self.update_services(matter, &Self::local_services(matter)?)
+                            .await?;
+                        info!("mDNS services updated");
+                    } else {
+                        info!("mDNS services changed; registering once Avahi is running");
+                    }
+                }
+                Either::Second(Some(signal)) => {
+                    let Ok(args) = signal.args() else { continue };
+                    debug!("Avahi server state {}", args.state);
 
-                Ok(())
-            })?;
+                    match args.state {
+                        AVAHI_SERVER_COLLISION | AVAHI_SERVER_REGISTERING => {
+                            running = false;
+                            if !self.services.is_empty() {
+                                info!(
+                                    "Avahi is re-establishing its host name, withdrawing {} mDNS service(s)",
+                                    self.services.len()
+                                );
+                                self.withdraw_services().await;
+                            }
+                        }
+                        AVAHI_SERVER_RUNNING if !running => {
+                            running = true;
+                            info!(
+                                "Avahi running as {}, registering mDNS services",
+                                avahi.get_host_name_fqdn().await?
+                            );
+                            self.update_services(matter, &Self::local_services(matter)?)
+                                .await?;
+                            info!("mDNS services updated");
+                        }
+                        AVAHI_SERVER_RUNNING => (),
+                        state => warn!("Avahi server state {}: {}", state, args.error),
+                    }
+                }
+                Either::Second(None) => {
+                    error!("Avahi server state signal stream ended");
+                    Err(ErrorCode::StdIoError)?;
+                }
+            }
+        }
+    }
 
-            info!("mDNS services changed, updating...");
+    /// The local Matter services the stack currently wants published.
+    fn local_services(matter: &Matter<'_>) -> Result<HashSet<MatterLocalService>, Error> {
+        let mut services = HashSet::new();
+        matter.mdns_services(|service| {
+            services.insert(service);
 
-            self.update_services(matter, &services).await?;
+            Ok(())
+        })?;
 
-            info!("mDNS services updated");
+        Ok(services)
+    }
+
+    /// Free every registered entry group; they are re-registered on the next
+    /// update. Failures are only logged: after an Avahi restart the groups are
+    /// already gone.
+    async fn withdraw_services(&mut self) {
+        let registered: Vec<_> = self.services.drain().collect();
+
+        for (service, path) in registered {
+            if let Err(e) = self.deregister(path.as_ref()).await {
+                warn!("Failed to withdraw mDNS service {:?}: {:?}", service, e);
+            }
         }
     }
 
