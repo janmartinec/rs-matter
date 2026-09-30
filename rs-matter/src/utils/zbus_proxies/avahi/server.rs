@@ -21,10 +21,12 @@
 
 use zbus::{proxy, zvariant::OwnedObjectPath};
 
+// The Avahi server object lives at `/` (`AVAHI_DBUS_PATH_SERVER`), for both the
+// `Server` and the `Server2` interface.
 #[proxy(
     interface = "org.freedesktop.Avahi.Server",
     default_service = "org.freedesktop.Avahi",
-    default_path = "/org/freedesktop/Avahi"
+    default_path = "/"
 )]
 pub trait Server {
     /// AddressResolverNew method
