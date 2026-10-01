@@ -553,6 +553,8 @@ impl Session {
     /// counter being recorded: the caller drops it unacknowledged, the peer's
     /// MRP retransmits it, and the retransmission is processed once a slot is
     /// free - rather than being taken for a duplicate and only acknowledged.
+    /// That works as long as the retransmission arrives before the peer's
+    /// counter has moved more than the dedup window (32 messages) past it.
     pub(crate) fn post_recv(&mut self, rx_header: &PacketHdr) -> Result<bool, Error> {
         // Check the counter on a copy; it is committed below unless the message
         // is refused for lack of an exchange slot.
