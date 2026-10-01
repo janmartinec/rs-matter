@@ -1670,7 +1670,7 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSpaceExchanges) => {
                 // The session has no exchange slot left for the peer (see
-                // `Session::has_responder_exchange_slot`). Drop the message
+                // `Session::add_exch`). Drop the message
                 // without an ACK; `Session::post_recv` did not record its counter,
                 // so the peer's MRP retransmission is processed once a slot frees
                 // up. Closing the session instead would abandon every in-flight
@@ -2758,10 +2758,13 @@ impl MessageCounters {
 /// starts with the first drop and ends with the first message processed at least
 /// [`Self::QUIET`] after the last drop.
 #[derive(Debug)]
-struct ExchangeOverflow {
+struct ExchangeOverflow(Option<OverflowEpisode>);
+
+#[derive(Debug)]
+struct OverflowEpisode {
     dropped: u32,
-    /// When the first and the last drop of the current episode happened.
-    span: Option<(Instant, Instant)>,
+    first: Instant,
+    last: Instant,
 }
 
 impl ExchangeOverflow {
@@ -2769,23 +2772,23 @@ impl ExchangeOverflow {
     const QUIET: Duration = Duration::from_secs(2);
 
     const fn new() -> Self {
-        Self {
-            dropped: 0,
-            span: None,
-        }
+        Self(None)
     }
 
     /// Record a dropped message; returns `true` if it starts a new episode.
     fn record_drop(&mut self, now: Instant) -> bool {
-        self.dropped = self.dropped.saturating_add(1);
-
-        match &mut self.span {
-            Some((_, last)) => {
-                *last = now;
+        match &mut self.0 {
+            Some(episode) => {
+                episode.dropped = episode.dropped.saturating_add(1);
+                episode.last = now;
                 false
             }
             None => {
-                self.span = Some((now, now));
+                self.0 = Some(OverflowEpisode {
+                    dropped: 1,
+                    first: now,
+                    last: now,
+                });
                 true
             }
         }
@@ -2794,15 +2797,14 @@ impl ExchangeOverflow {
     /// End the episode if no message was dropped for [`Self::QUIET`]; returns
     /// the number of messages it dropped and how long it lasted.
     fn end_if_quiet(&mut self, now: Instant) -> Option<(u32, Duration)> {
-        let (first, last) = self.span?;
-        if now.saturating_duration_since(last) < Self::QUIET {
-            return None;
-        }
+        let episode = self
+            .0
+            .take_if(|episode| now.saturating_duration_since(episode.last) >= Self::QUIET)?;
 
-        let dropped = core::mem::replace(&mut self.dropped, 0);
-        self.span = None;
-
-        Some((dropped, last.saturating_duration_since(first)))
+        Some((
+            episode.dropped,
+            episode.last.saturating_duration_since(episode.first),
+        ))
     }
 }
 

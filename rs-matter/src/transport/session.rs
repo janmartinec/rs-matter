@@ -563,17 +563,18 @@ impl Session {
             Err(ErrorCode::Duplicate)?;
         }
 
-        let exch_index = self.get_exch_for_rx(&rx_header.proto);
-
-        let opens_exchange = exch_index.is_none()
-            && rx_header.proto.is_initiator()
-            && MessageMeta::from(&rx_header.proto).is_new_exchange()
-            && !self.expired;
-        if opens_exchange && !self.has_responder_exchange_slot() {
-            Err(ErrorCode::NoSpaceExchanges)?;
+        let result = self.post_recv_exchange(rx_header);
+        if !matches!(&result, Err(e) if e.code() == ErrorCode::NoSpaceExchanges) {
+            self.rx_ctr_state = rx_ctr_state;
         }
 
-        self.rx_ctr_state = rx_ctr_state;
+        result
+    }
+
+    /// The exchange part of [`Self::post_recv`].
+    fn post_recv_exchange(&mut self, rx_header: &PacketHdr) -> Result<bool, Error> {
+        let exch_index = self.get_exch_for_rx(&rx_header.proto);
+
         if let Some(exch_index) = exch_index {
             let exch = unwrap!(self.exchanges[exch_index].as_mut());
 
@@ -830,18 +831,22 @@ impl Session {
             .next()
     }
 
-    /// Whether a peer-initiated (responder) exchange may be opened.
+    /// Open an exchange in a free slot.
     ///
-    /// [`RESERVED_INITIATOR_EXCHANGES`] slots are kept for exchanges this node
-    /// initiates on the session - above all subscription reports - so that a
-    /// peer issuing many requests at once cannot starve its own subscription.
-    fn has_responder_exchange_slot(&self) -> bool {
-        let used = self.exchanges.iter().filter(|exch| exch.is_some()).count();
-
-        used + RESERVED_INITIATOR_EXCHANGES < MAX_EXCHANGES
-    }
-
+    /// A peer-initiated (responder) exchange cannot take the last
+    /// [`RESERVED_INITIATOR_EXCHANGES`] slots: they are kept for exchanges this
+    /// node initiates on the session - above all subscription reports - so that
+    /// a peer issuing many requests at once cannot starve its own subscription.
     pub(crate) fn add_exch(&mut self, exch_id: u16, role: Role) -> Option<usize> {
+        let used = self.exchanges.iter().filter(|exch| exch.is_some()).count();
+        if matches!(role, Role::Responder(_))
+            && used + RESERVED_INITIATOR_EXCHANGES >= MAX_EXCHANGES
+        {
+            // Not an error: the caller drops the peer's message for its MRP to
+            // retransmit, and logs that per burst.
+            return None;
+        }
+
         let exch_state = Some(ExchangeState {
             exch_id,
             role,
@@ -1143,7 +1148,7 @@ cfg_if! {
 }
 
 /// Exchange slots of a session kept for exchanges this node initiates, which
-/// peer-initiated exchanges cannot take (see `Session::has_responder_exchange_slot`).
+/// peer-initiated exchanges cannot take (see `Session::add_exch`).
 pub const RESERVED_INITIATOR_EXCHANGES: usize = 1;
 
 const MATTER_MSG_CTR_RANGE: u32 = 0x0fffffff;
@@ -3105,7 +3110,7 @@ mod tests {
         assert!(sess.remove_exch(2));
         assert!(sess.exchanges[2].is_none());
         assert_eq!(
-            sess.add_exch(100, Role::Responder(Default::default())),
+            sess.add_exch(100, Role::Initiator(Default::default())),
             Some(2)
         );
 
