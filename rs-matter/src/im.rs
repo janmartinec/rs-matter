@@ -1360,6 +1360,16 @@ where
                     // could not report). Dropping it from the table on `rctx`
                     // drop means its persisted record must be purged too.
                     Ok(false) => dropped_any = true,
+                    Err(e) if matches!(e.code(), ErrorCode::NoSpaceExchanges) => {
+                        // Every exchange slot of the session is busy with the
+                        // subscriber's own requests; the session itself is fine.
+                        // Retry the report without tearing the session down.
+                        warn!(
+                            "No exchange slot for a report on subscription {:?}, will retry",
+                            rctx.subscription().ids()
+                        );
+                        rctx.set_keep_retry();
+                    }
                     Err(e) => {
                         // Reporting failed — typically because the session to the
                         // subscriber died (peer unreachable, MRP retransmissions

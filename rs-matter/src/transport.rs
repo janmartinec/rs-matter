@@ -26,7 +26,7 @@ use domain::base::name::ToLabelIter;
 #[cfg(feature = "groups")]
 use embassy_futures::select::select4;
 use embassy_futures::select::{select, select3, Either};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use rand_core::Rng;
 
@@ -154,6 +154,8 @@ pub struct Transport {
     resumption_dirty: Notification,
     /// Counters for the messages crossing this node.
     counters: Mutex<RefCell<MessageCounters>>,
+    /// Messages dropped for lack of an exchange slot, for the log.
+    exchange_overflow: Mutex<RefCell<ExchangeOverflow>>,
     /// Device SAI (Secure Association Identifier)
     device_sai: Option<u32>,
     /// Device SII (Secure Identity Identifier)
@@ -176,6 +178,7 @@ impl Transport {
             groups_modified: Notification::new(),
             resumption_dirty: Notification::new(),
             counters: Mutex::new(RefCell::new(MessageCounters::new())),
+            exchange_overflow: Mutex::new(RefCell::new(ExchangeOverflow::new())),
             device_sai: dev_det.sai,
             device_sii: dev_det.sii,
         }
@@ -195,6 +198,7 @@ impl Transport {
             groups_modified <- Notification::init(),
             resumption_dirty <- Notification::init(),
             counters <- Mutex::init(RefCell::init(MessageCounters::new())),
+            exchange_overflow <- Mutex::init(RefCell::init(ExchangeOverflow::new())),
             device_sai: dev_det.sai,
             device_sii: dev_det.sii,
         })
@@ -1665,42 +1669,29 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 }
             }
             Err(e) if matches!(e.code(), ErrorCode::NoSpaceExchanges) => {
-                // TODO: Before closing the session, try to take other measures:
-                // - For CASESigma1 & PBKDFParamRequest - send Busy instead
-                // - For Interaction Model interactions that do need an ACK - send IM Busy,
-                //   wait for ACK and retransmit without releasing the RX buffer, potentially
-                //   blocking all other interactions
-
-                error!(
-                    "\n>>RCV {}\n      => No space for a new exchange, closing session",
+                // The session has no exchange slot left for the peer (see
+                // `Session::has_responder_exchange_slot`). Drop the message
+                // without an ACK; `Session::post_recv` did not record its counter,
+                // so the peer's MRP retransmission is processed once a slot frees
+                // up. Closing the session instead would abandon every in-flight
+                // exchange and subscription of the peer merely for issuing many
+                // requests at once - e.g. a controller sending one Invoke per
+                // endpoint of a bridge for "turn on all lights".
+                let starts_episode = self
+                    .transport()
+                    .exchange_overflow
+                    .lock(|overflow| overflow.borrow_mut().record_drop(Instant::now()));
+                if starts_episode {
+                    warn!(
+                        "No space for a new exchange from {}, dropping (the peer will retransmit); \
+                         further drops are summed up",
+                        packet.peer
+                    );
+                }
+                mrp_log!(
+                    "\n>>RCV {}\n      => No space for a new exchange, dropped",
                     packet
                 );
-
-                self.matter.with_state(|state| {
-                    // `unwrap` is safe because we know we have a session.
-                    // If we didn't have a session, the error code would've been `NoSession`
-                    //
-                    // Also, since the transport code is single threaded, and since we don't `await`
-                    // after decoding the packet, no code can the session
-                    let session_id = unwrap!(state
-                        .sessions
-                        .get_for_rx(&packet.peer, &packet.header.plain))
-                    .id;
-
-                    packet.header.proto.exch_id = state.sessions.get_next_exch_id(&self.crypto)?;
-                    packet.header.proto.set_initiator();
-
-                    // See above why `unwrap` is safe
-                    let mut session = unwrap!(state.sessions.remove(session_id));
-                    self.transport().notify_session_removed();
-
-                    self.write_packet(packet, Some(&mut session), None, true, |wb| {
-                        sc_write(wb, SCStatusCodes::CloseSession, &[])
-                    })
-                })?;
-
-                Self::netw_send(send, packet.peer, &packet.buf[packet.payload_start..], true)
-                    .await?;
             }
             Err(e) if matches!(e.code(), ErrorCode::NoExchange) => {
                 mrp_log!(
@@ -1759,6 +1750,18 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 error!("\n>>RCV {}\n      => Error ({:?}), dropping", packet, e);
             }
             Ok(new_exchange) => {
+                if let Some((dropped, span)) = self
+                    .transport()
+                    .exchange_overflow
+                    .lock(|overflow| overflow.borrow_mut().end_if_quiet(Instant::now()))
+                {
+                    warn!(
+                        "Exchange slots are free again: {} message(s) dropped within {} ms",
+                        dropped,
+                        span.as_millis()
+                    );
+                }
+
                 let meta = MessageMeta::from(&packet.header.proto);
 
                 if meta.is_standalone_ack() {
@@ -2748,6 +2751,61 @@ impl MessageCounters {
     }
 }
 
+/// Messages dropped for lack of an exchange slot, summed up per burst.
+///
+/// A burst of requests drops many messages, each possibly several times over its
+/// retransmissions; one log line per drop would flood a small log. An episode
+/// starts with the first drop and ends with the first message processed at least
+/// [`Self::QUIET`] after the last drop.
+#[derive(Debug)]
+struct ExchangeOverflow {
+    dropped: u32,
+    /// When the first and the last drop of the current episode happened.
+    span: Option<(Instant, Instant)>,
+}
+
+impl ExchangeOverflow {
+    /// How long no message may have been dropped for the episode to be over.
+    const QUIET: Duration = Duration::from_secs(2);
+
+    const fn new() -> Self {
+        Self {
+            dropped: 0,
+            span: None,
+        }
+    }
+
+    /// Record a dropped message; returns `true` if it starts a new episode.
+    fn record_drop(&mut self, now: Instant) -> bool {
+        self.dropped = self.dropped.saturating_add(1);
+
+        match &mut self.span {
+            Some((_, last)) => {
+                *last = now;
+                false
+            }
+            None => {
+                self.span = Some((now, now));
+                true
+            }
+        }
+    }
+
+    /// End the episode if no message was dropped for [`Self::QUIET`]; returns
+    /// the number of messages it dropped and how long it lasted.
+    fn end_if_quiet(&mut self, now: Instant) -> Option<(u32, Duration)> {
+        let (first, last) = self.span?;
+        if now.saturating_duration_since(last) < Self::QUIET {
+            return None;
+        }
+
+        let dropped = core::mem::replace(&mut self.dropped, 0);
+        self.span = None;
+
+        Some((dropped, last.saturating_duration_since(first)))
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -2757,6 +2815,37 @@ mod tests {
 
     fn test_matter() -> Matter<'static> {
         Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0)
+    }
+
+    /// A burst of drops is one episode: only its first drop starts one, and it
+    /// ends with the first message processed `QUIET` after its last drop.
+    #[test]
+    fn exchange_overflow_sums_up_a_burst() {
+        let t0 = Instant::from_millis(1_000);
+        let ms = Duration::from_millis;
+        let mut overflow = ExchangeOverflow::new();
+
+        assert!(overflow.end_if_quiet(t0).is_none());
+
+        assert!(overflow.record_drop(t0));
+        assert!(!overflow.record_drop(t0 + ms(100)));
+        assert!(!overflow.record_drop(t0 + ms(400)));
+
+        // Messages processed in between do not end it ...
+        assert!(overflow.end_if_quiet(t0 + ms(500)).is_none());
+        assert!(overflow
+            .end_if_quiet(t0 + ms(400) + ExchangeOverflow::QUIET - ms(1))
+            .is_none());
+
+        // ... the first one after a quiet period does.
+        assert_eq!(
+            overflow.end_if_quiet(t0 + ms(400) + ExchangeOverflow::QUIET),
+            Some((3, ms(400)))
+        );
+        assert!(overflow.end_if_quiet(t0 + ms(10_000)).is_none());
+
+        // The next drop starts a new episode.
+        assert!(overflow.record_drop(t0 + ms(20_000)));
     }
 
     #[test]

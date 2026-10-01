@@ -547,15 +547,31 @@ impl Session {
     /// Update the session state with the data in the received packet headers.
     ///
     /// Return `true` if a new exchange was created, and `false` otherwise.
+    ///
+    /// A message that would open a new exchange while the session has no slot
+    /// left for it fails with [`ErrorCode::NoSpaceExchanges`] *without* its
+    /// counter being recorded: the caller drops it unacknowledged, the peer's
+    /// MRP retransmits it, and the retransmission is processed once a slot is
+    /// free - rather than being taken for a duplicate and only acknowledged.
     pub(crate) fn post_recv(&mut self, rx_header: &PacketHdr) -> Result<bool, Error> {
-        if !self
-            .rx_ctr_state
-            .post_recv(rx_header.plain.ctr, self.is_encrypted(), false)
-        {
+        // Check the counter on a copy; it is committed below unless the message
+        // is refused for lack of an exchange slot.
+        let mut rx_ctr_state = self.rx_ctr_state.clone();
+        if !rx_ctr_state.post_recv(rx_header.plain.ctr, self.is_encrypted(), false) {
             Err(ErrorCode::Duplicate)?;
         }
 
         let exch_index = self.get_exch_for_rx(&rx_header.proto);
+
+        let opens_exchange = exch_index.is_none()
+            && rx_header.proto.is_initiator()
+            && MessageMeta::from(&rx_header.proto).is_new_exchange()
+            && !self.expired;
+        if opens_exchange && !self.has_responder_exchange_slot() {
+            Err(ErrorCode::NoSpaceExchanges)?;
+        }
+
+        self.rx_ctr_state = rx_ctr_state;
         if let Some(exch_index) = exch_index {
             let exch = unwrap!(self.exchanges[exch_index].as_mut());
 
@@ -810,6 +826,17 @@ impl Session {
             })
             .map(|(index, _)| index)
             .next()
+    }
+
+    /// Whether a peer-initiated (responder) exchange may be opened.
+    ///
+    /// [`RESERVED_INITIATOR_EXCHANGES`] slots are kept for exchanges this node
+    /// initiates on the session - above all subscription reports - so that a
+    /// peer issuing many requests at once cannot starve its own subscription.
+    fn has_responder_exchange_slot(&self) -> bool {
+        let used = self.exchanges.iter().filter(|exch| exch.is_some()).count();
+
+        used + RESERVED_INITIATOR_EXCHANGES < MAX_EXCHANGES
     }
 
     pub(crate) fn add_exch(&mut self, exch_id: u16, role: Role) -> Option<usize> {
@@ -1112,6 +1139,10 @@ cfg_if! {
         pub const MAX_EXCHANGES: usize = 5;
     }
 }
+
+/// Exchange slots of a session kept for exchanges this node initiates, which
+/// peer-initiated exchanges cannot take (see `Session::has_responder_exchange_slot`).
+pub const RESERVED_INITIATOR_EXCHANGES: usize = 1;
 
 const MATTER_MSG_CTR_RANGE: u32 = 0x0fffffff;
 
@@ -3150,6 +3181,54 @@ mod tests {
         rx.plain.ctr = 6;
         rx.proto.exch_id = 7;
         assert!(!unwrap!(sess.post_recv(&rx)));
+    }
+
+    /// A message that would open an exchange while no responder slot is free is
+    /// refused with `NoSpaceExchanges` without its counter being recorded, so
+    /// the peer's retransmission is accepted once a slot frees up; the reserved
+    /// slot stays available for exchanges this node initiates.
+    #[test]
+    fn post_recv_refuses_new_exchange_without_recording_counter() {
+        use crate::sc::{self, PROTO_ID_SECURE_CHANNEL};
+
+        let mut sess = Session::new(1, 0, false, Address::default(), None, 300, 5000, 4000);
+
+        let mut rx = PacketHdr::new();
+        rx.proto.proto_id = PROTO_ID_SECURE_CHANNEL;
+        rx.proto.proto_opcode = sc::OpCode::PBKDFParamRequest as u8;
+        rx.proto.set_initiator();
+        rx.proto.set_reliable();
+
+        // Peer-initiated exchanges take every slot but the reserved ones ...
+        let responder_slots = MAX_EXCHANGES - RESERVED_INITIATOR_EXCHANGES;
+        for i in 0..responder_slots {
+            rx.plain.ctr = i as u32 + 1;
+            rx.proto.exch_id = i as u16;
+            assert!(unwrap!(sess.post_recv(&rx)));
+        }
+
+        // ... so one more is refused, ...
+        rx.plain.ctr = responder_slots as u32 + 1;
+        rx.proto.exch_id = 100;
+        assert_eq!(
+            unwrap!(sess.post_recv(&rx).err()).code(),
+            ErrorCode::NoSpaceExchanges
+        );
+
+        // ... while this node can still initiate one of its own.
+        let initiated = unwrap!(sess.add_exch(200, Role::Initiator(Default::default())));
+        sess.exchanges[initiated] = None;
+
+        // Once a slot frees up, the retransmission (same counter) opens its
+        // exchange instead of being taken for a duplicate ...
+        sess.exchanges[0] = None;
+        assert!(unwrap!(sess.post_recv(&rx)));
+
+        // ... and a real duplicate is still recognized as one.
+        assert_eq!(
+            unwrap!(sess.post_recv(&rx).err()).code(),
+            ErrorCode::Duplicate
+        );
     }
 
     /// Sending stamps the plain header per session mode: plaintext sessions
